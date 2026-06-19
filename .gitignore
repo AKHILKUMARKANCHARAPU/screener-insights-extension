@@ -1,0 +1,16 @@
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+.idea/
+.vscode/
+
+# Logs / temp
+*.log
+*.tmp
+
+# Packaged builds
+*.zip
+*.crx
+*.pem

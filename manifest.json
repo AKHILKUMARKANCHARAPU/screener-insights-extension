@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Screener Insights",
+  "version": "1.0.0",
+  "description": "Interactive charts and financial metrics overlay for Screener.in",
+  "host_permissions": [
+    "https://www.screener.in/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["https://www.screener.in/company/*"],
+      "js": [
+        "lib/chart.min.js",
+        "src/scraper.js",
+        "src/charts.js",
+        "src/panel.js",
+        "src/content.js"
+      ],
+      "css": ["styles/panel.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Screener Insights"
+  }
+}
