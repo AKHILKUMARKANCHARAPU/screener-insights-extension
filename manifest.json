@@ -3,6 +3,11 @@
   "name": "Screener Insights",
   "version": "1.0.0",
   "description": "Interactive charts and financial metrics overlay for Screener.in",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
   "host_permissions": [
     "https://www.screener.in/*"
   ],
@@ -21,6 +26,11 @@
     }
   ],
   "action": {
-    "default_title": "Screener Insights"
+    "default_title": "Screener Insights",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
   }
 }
