@@ -60,12 +60,43 @@ ScreenerInsights.panel = (() => {
     return `<div class="si-section-head">${text}</div>`;
   }
 
+  // Edge-aware positioning for a range-gauge value tip so it never overflows
+  // the card: near the right end it anchors right (extends left), near the left
+  // end it anchors left (extends right), otherwise stays centred on the dot.
+  function tipAlignStyle(pct) {
+    if (pct >= 80) return ';left:auto;right:0;transform:none';
+    if (pct <= 20) return ';left:0;right:auto;transform:none';
+    return '';
+  }
+
   function callout(color, text) {
     return `<div class="si-callout si-callout-${color}">${text}</div>`;
   }
 
   function pct(v, dec = 1) { return v != null ? v.toFixed(dec) + '%' : 'N/A'; }
   function num(v, dec = 1) { return v != null ? v.toFixed(dec) : 'N/A'; }
+
+  // Gross Profit Margin = (Sales − COGS) / Sales × 100, latest year.
+  // COGS = raw materials + purchases of stock-in-trade + change in inventory.
+  function latestGPM(pnl) {
+    if (!pnl) return null;
+    const sales = findRowLocal(pnl.data, 'Sales', 'Revenue', 'Net Sales', 'Total Revenue');
+    if (!sales || !sales.length) return null;
+    const idx = sales.length - 1;
+    const s = sales[idx];
+    if (s == null || s <= 0) return null;
+    const cogsKeys = Object.keys(pnl.data).filter(k => {
+      const l = k.toLowerCase();
+      return l.includes('cost of material') || l.includes('raw material')
+          || (l.includes('purchase') && l.includes('stock'))
+          || l.includes('change in invent') || l.includes('changes in invent');
+    });
+    if (!cogsKeys.length) return null;
+    let cogs = 0, any = false;
+    cogsKeys.forEach(k => { const v = pnl.data[k][idx]; if (v != null && !isNaN(v)) { cogs += v; any = true; } });
+    if (!any) return null;
+    return parseFloat(((s - cogs) / s * 100).toFixed(1));
+  }
 
   // ── Key ratio getter ──────────────────────────────────────────────────────
 
@@ -164,6 +195,15 @@ ScreenerInsights.panel = (() => {
                             : getLatest('Pledged', 'Pledge');
       const fiiPct      = getLatest('FII', 'Foreign');
       const diiPct      = getLatest('DII', 'Domestic');
+      const pubPctRaw   = getLatest('Public');
+      const pubPct      = pubPctRaw !== 'N/A' ? pubPctRaw : 'N/A';
+      // Others = residual after Promoters/FII/DII/Public (incl. Government, Bodies, etc.)
+      const othersPct   = (() => {
+        const n = [promoterPct, fiiPct, diiPct, pubPctRaw].map(p => parseFloat(p));
+        if (n.some(isNaN)) return 'N/A';
+        const o = 100 - n.reduce((a, b) => a + b, 0);
+        return o > 0.05 ? o.toFixed(1) + '%' : '0.0%';
+      })();
 
       // Pledge color: 0 = green, 1–10 = orange, >10 = red
       const pledgeNum = parseFloat(pledgePct);
@@ -237,8 +277,8 @@ ScreenerInsights.panel = (() => {
               <span class="si-sh-dot" style="background:#6366f1"></span>Promoters ${promoterPct}
               <span class="si-sh-dot" style="background:#22d3ee;margin-left:8px"></span>FII ${fiiPct}
               <span class="si-sh-dot" style="background:#34d399;margin-left:8px"></span>DII ${diiPct}
-              <span class="si-sh-dot" style="background:#f59e0b;margin-left:8px"></span>Public
-              <span class="si-sh-dot" style="background:#94a3b8;margin-left:8px"></span>Others
+              <span class="si-sh-dot" style="background:#f59e0b;margin-left:8px"></span>Public ${pubPct}
+              <span class="si-sh-dot" style="background:#94a3b8;margin-left:8px"></span>Others ${othersPct}
             </div>
             <div class="si-sh-pledge" style="color:${pledgeColor === 'si-green' ? '#34d399' : pledgeColor === 'si-red' ? '#f87171' : '#f59e0b'}">
               Pledge: ${pledgePct}
@@ -246,6 +286,13 @@ ScreenerInsights.panel = (() => {
           </div>
           <div class="si-sh-holders">
             ${fiiBlock}${diiBlock}${starBlock}
+            ${!fiiBlock && !diiBlock && !starBlock
+              ? `<div class="si-th-block"><div class="si-th-label">Top Institutional Holders</div>
+                   <div style="font-size:10px;color:#64748b;line-height:1.5;padding:2px 0">
+                     Named FII / DII holder data isn't available for this company on screener
+                     (common for SME / small-cap stocks). Aggregate FII ${fiiPct} · DII ${diiPct} shown in the donut.
+                   </div></div>`
+              : ''}
           </div>
         </div>
         ${chartBlock('si-c-promoter-trend', 'Promoter / FII / DII Holding % — Quarterly', 215)}
@@ -401,8 +448,28 @@ ScreenerInsights.panel = (() => {
         const ttmNpm = (ttmNetProf != null && ttmSales != null && ttmSales > 0)
           ? parseFloat(((ttmNetProf - (ttmOtherInc ?? 0)) / ttmSales * 100).toFixed(1)) : null;
 
-        console.debug('[SI] OPM:', opm, '| NPM:', npm, '| TTM OPM:', ttmOpm, '| TTM NPM:', ttmNpm, '| latest qtr:', latestHdr);
-        if (opm == null && npm == null && ttmOpm == null && ttmNpm == null) return '';
+        // If the latest ANNUAL (P&L) period is more recent than the latest
+        // reported quarter, prefer the annual figure for the "current" cards.
+        const periodVal = s => {
+          const m = String(s).match(/([A-Za-z]{3})[a-z]*\s*'?(\d{2,4})/);
+          if (!m) return 0;
+          const mo = { jan:1,feb:2,mar:3,apr:4,may:5,jun:6,jul:7,aug:8,sep:9,oct:10,nov:11,dec:12 }[m[1].toLowerCase()] || 1;
+          let y = +m[2]; if (y < 100) y += 2000;
+          return y + mo / 12;
+        };
+        let curOpm = opm, curNpm = npm, curHdr = latestHdr;
+        if (d.pnl) {
+          const annOpmRow = findRowLocal(d.pnl.data, 'OPM %');
+          const annOpm = annOpmRow ? annOpmRow[annOpmRow.length - 1] : null;
+          const annNpm = d.derived?.npm ? d.derived.npm[d.derived.npm.length - 1] : null;
+          const annHdr = d.pnl.headers ? d.pnl.headers[d.pnl.headers.length - 1] : null;
+          if (annHdr && periodVal(annHdr) > periodVal(latestHdr) && (annOpm != null || annNpm != null)) {
+            curOpm = annOpm; curNpm = annNpm; curHdr = annHdr;
+          }
+        }
+
+        console.debug('[SI] OPM:', curOpm, '| NPM:', curNpm, '| TTM OPM:', ttmOpm, '| TTM NPM:', ttmNpm, '| period:', curHdr);
+        if (curOpm == null && curNpm == null && ttmOpm == null && ttmNpm == null) return '';
 
         const mColor = v => v == null ? '#64748b' : v < 0 ? '#f87171' : v >= 20 ? '#34d399' : v >= 10 ? '#f59e0b' : '#f87171';
         const mCard = (lbl, v, sublbl, desc) => v == null ? '' : `
@@ -412,11 +479,15 @@ ScreenerInsights.panel = (() => {
             <div class="si-card-sub" style="font-size:9px;color:#475569;line-height:1.3">${desc}</div>
           </div>`;
 
+        const gpm = latestGPM(d.pnl);
+        const gpmHdr = d.pnl?.headers?.length ? d.pnl.headers[d.pnl.headers.length - 1] : '';
+
         return `
         ${sectionHead('Operating & Net Margins')}
         <div class="si-grid" data-grid-id="ov-margins">
-          ${mCard('OPM %', opm,    latestHdr,     'Excl. other income, dep, interest & tax')}
-          ${mCard('NPM %', npm,    latestHdr,     'Net profit excl. other income ÷ sales')}
+          ${mCard('GPM %', gpm,    gpmHdr,        'Gross profit (Sales − COGS) ÷ sales')}
+          ${mCard('OPM %', curOpm, curHdr,        'Excl. other income, dep, interest & tax')}
+          ${mCard('NPM %', curNpm, curHdr,        'Net profit excl. other income ÷ sales')}
           ${mCard('OPM %', ttmOpm, 'TTM (4 Qtrs)', 'Sum of last 4 qtrs — operating profit ÷ sales')}
           ${mCard('NPM %', ttmNpm, 'TTM (4 Qtrs)', 'Sum of last 4 qtrs — net profit excl. other income')}
         </div>`;
@@ -445,7 +516,7 @@ ScreenerInsights.panel = (() => {
             <div class="si-52w-fill" style="width:100%"></div>
             <div class="si-52w-thumb" style="left:calc(${pct}% - 7px)">
               <div class="si-52w-dot" style="background:${dotColor};box-shadow:0 0 6px ${dotColor}88"></div>
-              <div class="si-52w-tip" style="color:${dotColor}">₹${price}</div>
+              <div class="si-52w-tip" style="color:${dotColor}${tipAlignStyle(pct)}">₹${price}</div>
             </div>
           </div>
           <div class="si-52w-ends">
@@ -489,7 +560,7 @@ ScreenerInsights.panel = (() => {
             ${medPct != null ? `<div class="si-52w-median" style="left:${medPct}%" title="Median PE ${pe.median}x"></div>` : ''}
             <div class="si-52w-thumb" style="left:calc(${pct}% - 7px)">
               <div class="si-52w-dot" style="background:${dotColor};box-shadow:0 0 6px ${dotColor}88"></div>
-              <div class="si-52w-tip" style="color:${dotColor}">${cur}x</div>
+              <div class="si-52w-tip" style="color:${dotColor}${tipAlignStyle(pct)}">${cur}x</div>
             </div>
           </div>
           <div class="si-52w-ends">
@@ -968,19 +1039,28 @@ ScreenerInsights.panel = (() => {
       ${chartBlock('si-c-ssgr-trend', 'SSGR Trend (%)', 215)}`;
   }
 
+  // ── PEG: which EPS-growth window to use (persisted) ──────────────────────
+  const PEG_YEARS_KEY = 'si_peg_years';
+  const PEG_OPTIONS = [1, 3, 5, 10];
+  function getPegYears() {
+    const v = parseInt(localStorage.getItem(PEG_YEARS_KEY), 10);
+    return PEG_OPTIONS.includes(v) ? v : 5;
+  }
+  function savePegYears(v) { localStorage.setItem(PEG_YEARS_KEY, v); }
+
   // ── Valuation tab — current PE vs 10-year history ─────────────────────────
   function tabValuation(d) {
-    const pe = d.peRange;
-    if (!pe || pe.current == null) {
-      return `${sectionHead('Valuation')}${callout('info', 'P/E history is unavailable for this company (loss-making or insufficient data).')}`;
-    }
-
-    const cur   = pe.current;
+    // P/E history may be unavailable (loss-making / SME with no chart data),
+    // but the rest of the tab (PEG, P/S, EV/EBITDA, Earnings Yield) can still
+    // render — so we degrade gracefully instead of blanking the whole tab.
+    const pe = d.peRange || {};
+    const peAvailable = pe.current != null;
+    const cur   = peAvailable ? pe.current : (d.derived?.pe ?? null);
     const yrs   = pe.years || 10;
     // Preferred reference = computed 10Y median of the PE series; fall back to screener median or mean
-    const ref   = pe.med10 ?? pe.median ?? pe.mean;
+    const ref   = peAvailable ? (pe.med10 ?? pe.median ?? pe.mean) : null;
     const refLbl = pe.med10 != null ? 'median' : pe.median != null ? 'median' : 'average';
-    const devPct = (ref != null && ref > 0) ? ((cur - ref) / ref * 100) : null;
+    const devPct = (ref != null && ref > 0 && cur != null) ? ((cur - ref) / ref * 100) : null;
     const rank   = pe.pctRank;   // % of the last-10Y period the PE traded AT or BELOW current
 
     // Verdict from deviation vs median + percentile rank
@@ -997,26 +1077,37 @@ ScreenerInsights.panel = (() => {
     const devColor = devPct == null ? '#64748b' : devPct <= -20 ? '#34d399' : devPct <= 10 ? '#fbbf24' : '#f87171';
 
     // Position of current PE within the 10Y low–high band (for a quick gauge)
-    const pos = (pe.high > pe.low) ? Math.min(100, Math.max(0, (cur - pe.low) / (pe.high - pe.low) * 100)) : null;
+    const pos = (peAvailable && pe.high > pe.low && cur != null) ? Math.min(100, Math.max(0, (cur - pe.low) / (pe.high - pe.low) * 100)) : null;
 
     // ── PEG ratio = P/E ÷ EPS growth rate (%) ────────────────────────────────
-    let epsGrowth = null, epsWin = null;
+    // EPS-growth window is user-selectable (1Y / 3Y / 5Y / 10Y).
+    const pegYears = getPegYears();
+    let epsGrowth = null, epsWin = null, epsReason = null;
     const epsRow = d.pnl ? findRowLocal(d.pnl.data, 'EPS in Rs', 'EPS', 'Adjusted EPS in Rs') : null;
-    if (epsRow) {
+    if (!epsRow) {
+      epsReason = 'EPS row not found';
+    } else {
       const vals = epsRow.filter(v => v != null && !isNaN(v));
-      if (vals.length >= 2) {
-        const w = Math.min(5, vals.length);
-        const s = vals[vals.length - w], e = vals[vals.length - 1];
-        if (s > 0 && e > 0) { epsGrowth = (Math.pow(e / s, 1 / (w - 1)) - 1) * 100; epsWin = w; }
+      if (vals.length < 2) {
+        epsReason = 'not enough EPS history';
+      } else {
+        // Use the longest span available up to the selected window.
+        // span = number of year-intervals (e.g. 10 annual points → 9-year span).
+        const span = Math.min(pegYears, vals.length - 1);
+        const s = vals[vals.length - 1 - span], e = vals[vals.length - 1];
+        if (s > 0 && e > 0) {
+          epsGrowth = (Math.pow(e / s, 1 / span) - 1) * 100;
+          epsWin = span;
+        } else {
+          epsReason = 'EPS was zero/negative at the start of the window';
+        }
       }
     }
-    // Fallback to profit CAGR if EPS endpoints are unusable
-    if (epsGrowth == null && d.derived?.profCAGR5 != null) { epsGrowth = d.derived.profCAGR5; epsWin = 5; }
 
     const peg = (epsGrowth != null && epsGrowth > 0) ? cur / epsGrowth : null;
     const pegStatus = peg == null ? 'info' : peg < 1 ? 'pass' : peg <= 1.5 ? 'caution' : 'fail';
     const pegColor  = peg == null ? '#64748b' : peg < 1 ? '#34d399' : peg <= 1.5 ? '#fbbf24' : '#f87171';
-    const pegVerdict = peg == null ? (epsGrowth != null && epsGrowth <= 0 ? 'EPS not growing — PEG not meaningful' : 'EPS growth unavailable')
+    const pegVerdict = peg == null ? (epsGrowth != null && epsGrowth <= 0 ? 'EPS not growing — PEG not meaningful' : `PEG unavailable — ${epsReason || 'EPS growth could not be computed'}`)
                      : peg < 1 ? 'PEG < 1 — undervalued relative to its earnings growth'
                      : peg <= 1.5 ? 'PEG ≈ 1 — fairly priced for its growth'
                      : 'PEG > 1 — expensive relative to its earnings growth';
@@ -1042,19 +1133,20 @@ ScreenerInsights.panel = (() => {
     const vLabel = s => s === 'pass' ? 'Undervalued' : s === 'caution' ? 'Fairly valued' : s === 'fail' ? 'Overvalued' : '—';
 
     const summaryRows = [
-      { m: 'P/E (vs 10Y median)', val: `${cur}x`,             bench: ref != null ? `${ref}x median` : '—',          s: status },
+      { m: 'P/E (vs 10Y median)', val: cur != null ? `${cur}x` : 'N/A', bench: ref != null ? `${ref}x median` : '—', s: cur == null ? 'info' : status },
       { m: 'PEG (P/E ÷ growth)',  val: peg != null ? peg.toFixed(2) : 'N/A', bench: '< 1 cheap',                   s: pegStatus },
       { m: 'P/S',                 val: psR?.current != null ? `${psR.current}x` : 'N/A', bench: psR?.median != null ? `${psR.median}x median` : '< 1.5 cheap', s: psStat },
       { m: 'EV / EBITDA',         val: evR?.current != null ? `${evR.current}x` : 'N/A', bench: evR?.median != null ? `${evR.median}x median` : '—', s: evStat },
       { m: 'Earnings Yield',      val: eyV != null ? `${eyV}%` : 'N/A',      bench: `G-Sec ${GSEC_YIELD}%`,         s: eyStat },
     ];
 
+    const summaryTd = 'padding:10px 14px !important';
     const summaryTable = summaryRows.map(r => `
       <tr>
-        <td>${r.m}</td>
-        <td style="text-align:right;font-weight:600">${r.val}</td>
-        <td style="text-align:right;color:#64748b;font-size:11px">${r.bench}</td>
-        <td style="text-align:center">${badge(r.s, r.s === 'info' ? 'N/A' : vLabel(r.s))}</td>
+        <td style="${summaryTd}">${r.m}</td>
+        <td style="${summaryTd};text-align:right;font-weight:600">${r.val}</td>
+        <td style="${summaryTd};text-align:right;color:#64748b;font-size:11px">${r.bench}</td>
+        <td style="${summaryTd};text-align:center">${badge(r.s, r.s === 'info' ? 'N/A' : vLabel(r.s))}</td>
       </tr>`).join('');
 
     // Overall verdict: score pass +1 / fail −1 across evaluated metrics
@@ -1077,8 +1169,8 @@ ScreenerInsights.panel = (() => {
         <div class="si-verdict-label-final">Overall Verdict</div>
         <div class="si-verdict-text">${overall.t}</div>
       </div>
-      <div class="si-table-wrap" style="margin-bottom:6px">
-        <table class="si-table">
+      <div class="si-table-wrap" style="margin-bottom:6px;max-height:none;overflow:visible">
+        <table class="si-table" style="line-height:1.6">
           <thead><tr><th>Metric</th><th style="text-align:right">Current</th><th style="text-align:right">Benchmark</th><th style="text-align:center">Read</th></tr></thead>
           <tbody>${summaryTable}</tbody>
         </table>
@@ -1086,6 +1178,7 @@ ScreenerInsights.panel = (() => {
       ${callout(overall.c === 'pass' ? 'green' : overall.c === 'fail' ? 'red' : 'info', overallBody)}
 
       ${sectionHead(`P/E — Current vs Last ${yrs} Years`)}
+      ${!peAvailable ? callout('info', `P/E history is unavailable for this company (loss-making or no chart data)${cur != null ? ` — current P/E is ${cur}x` : ''}. Other valuation metrics below are still shown where data permits.`) : ''}
       ${pos != null ? `
       <div class="si-52w-card" style="margin-top:10px">
         <div class="si-52w-header"><span class="si-52w-title">WHERE CURRENT P/E SITS IN ${yrs}Y RANGE</span></div>
@@ -1094,7 +1187,7 @@ ScreenerInsights.panel = (() => {
           ${ref != null && pe.high > pe.low ? `<div class="si-52w-median" style="left:${Math.min(100,Math.max(0,(ref-pe.low)/(pe.high-pe.low)*100))}%" title="${refLbl} ${ref}x"></div>` : ''}
           <div class="si-52w-thumb" style="left:calc(${pos}% - 7px)">
             <div class="si-52w-dot" style="background:${devColor};box-shadow:0 0 6px ${devColor}88"></div>
-            <div class="si-52w-tip" style="color:${devColor}">${cur}x</div>
+            <div class="si-52w-tip" style="color:${devColor}${tipAlignStyle(pos)}">${cur}x</div>
           </div>
         </div>
         <div class="si-52w-ends">
@@ -1105,10 +1198,18 @@ ScreenerInsights.panel = (() => {
       </div>` : ''}
 
       ${sectionHead('PEG Ratio — P/E vs Earnings Growth')}
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:2px 0 8px">
+        <span style="font-size:10px;color:#64748b;letter-spacing:.4px">EPS GROWTH WINDOW:</span>
+        ${PEG_OPTIONS.map(w => `
+          <label style="display:inline-flex;align-items:center;gap:4px;font-size:11px;color:${w === pegYears ? '#e2e8f0' : '#94a3b8'};cursor:pointer">
+            <input type="radio" name="si-peg-years" value="${w}" ${w === pegYears ? 'checked' : ''} style="accent-color:#6366f1;cursor:pointer">
+            ${w === 1 ? '1Y (YoY)' : w + 'Y'}
+          </label>`).join('')}
+      </div>
       <div class="si-grid">
         ${statCard('PEG Ratio', peg != null ? `<span style="color:${pegColor}">${peg.toFixed(2)}</span>` : 'N/A', `P/E ÷ EPS growth`)}
-        ${statCard('Current P/E', `${cur}x`, 'numerator')}
-        ${statCard(`EPS Growth${epsWin ? ` (${epsWin}Y)` : ''}`, epsGrowth != null ? `${epsGrowth.toFixed(1)}%` : 'N/A', 'CAGR — denominator')}
+        ${statCard('Current P/E', cur != null ? `${cur}x` : 'N/A', 'numerator')}
+        ${statCard(`EPS Growth${epsWin ? ` (${epsWin}Y)` : ''}`, epsGrowth != null ? `${epsGrowth.toFixed(1)}%` : 'N/A', epsGrowth != null ? 'CAGR — denominator' : (epsReason || 'CAGR — denominator'))}
       </div>
 
       ${(() => {
@@ -1141,7 +1242,7 @@ ScreenerInsights.panel = (() => {
               ${ref != null ? `<div class="si-52w-median" style="left:${Math.min(100,Math.max(0,(ref-ps.low)/(ps.high-ps.low)*100))}%" title="median ${ref}x"></div>` : ''}
               <div class="si-52w-thumb" style="left:calc(${pos}% - 7px)">
                 <div class="si-52w-dot" style="background:${psColor};box-shadow:0 0 6px ${psColor}88"></div>
-                <div class="si-52w-tip" style="color:${psColor}">${cur}x</div>
+                <div class="si-52w-tip" style="color:${psColor}${tipAlignStyle(pos)}">${cur}x</div>
               </div>
             </div>
             <div class="si-52w-ends">
@@ -1181,7 +1282,7 @@ ScreenerInsights.panel = (() => {
               ${ref != null ? `<div class="si-52w-median" style="left:${Math.min(100,Math.max(0,(ref-ev.low)/(ev.high-ev.low)*100))}%" title="median ${ref}x"></div>` : ''}
               <div class="si-52w-thumb" style="left:calc(${pos}% - 7px)">
                 <div class="si-52w-dot" style="background:${evColor};box-shadow:0 0 6px ${evColor}88"></div>
-                <div class="si-52w-tip" style="color:${evColor}">${cur}x</div>
+                <div class="si-52w-tip" style="color:${evColor}${tipAlignStyle(pos)}">${cur}x</div>
               </div>
             </div>
             <div class="si-52w-ends">
@@ -1212,6 +1313,340 @@ ScreenerInsights.panel = (() => {
             ${statCard('EY Spread', spread != null ? `<span style="color:${spreadColor}">${spread >= 0 ? '+' : ''}${spread.toFixed(2)}%</span>` : 'N/A', 'EY − G-Sec')}
           </div>`;
       })()}`;
+  }
+
+  // ── Compare feature: snapshot basket + side-by-side table ─────────────────
+  const COMPARE_KEY = 'si_compare_basket';
+  function getBasket() { try { return JSON.parse(localStorage.getItem(COMPARE_KEY) || '[]'); } catch (_) { return []; } }
+  function saveBasket(a) { localStorage.setItem(COMPARE_KEY, JSON.stringify(a)); }
+  function addToBasket(snap) { const a = getBasket().filter(x => x.id !== snap.id); a.push(snap); saveBasket(a); }
+  function removeFromBasket(id) { saveBasket(getBasket().filter(x => x.id !== id)); }
+
+  // Metrics compared, grouped, with "best" direction (high/low/none).
+  // `allowNeg` lets a 'low' metric rank negative values as best (e.g. CCC).
+  const CMP_GROUPS = ['Valuation metrics', 'Return ratios', 'Profitability metrics', 'Cashflow metrics', 'Liquidity metrics', 'Solvency metrics', 'Efficiency metrics'];
+  const pctF = v => v == null ? '—' : v + '%';
+  const xF   = v => v == null ? '—' : v + 'x';
+  const inr  = v => v == null ? '—' : Math.round(v).toLocaleString('en-IN');
+  const CMP_METRICS = [
+    // ── Valuation ──
+    { g: 'Valuation metrics', k: 'price', label: 'Current Price (₹)', dir: 'none', fmt: v => v == null ? '—' : '₹' + v.toLocaleString('en-IN') },
+    { g: 'Valuation metrics', k: 'hl52',  label: '52W High / Low (₹)', dir: 'none', fmt: v => v == null ? '—' : `₹${inr(v.hi)} / ${inr(v.lo)}` },
+    { g: 'Valuation metrics', k: 'mcap', label: 'Market Cap (₹ Cr)', dir: 'none', fmt: inr },
+    { g: 'Valuation metrics', k: 'pe',   label: 'P/E',               dir: 'low',  fmt: xF },
+    { g: 'Valuation metrics', k: 'ps',   label: 'P/S',               dir: 'low',  fmt: xF },
+    { g: 'Valuation metrics', k: 'ev',   label: 'EV / EBITDA',       dir: 'low',  fmt: xF },
+    { g: 'Valuation metrics', k: 'peg',  label: 'PEG (YoY)',         dir: 'low',  fmt: v => v == null ? '—' : v.toFixed(2) },
+    // ── Return ratios ──
+    { g: 'Return ratios', k: 'roe',  label: 'ROE %',  dir: 'high', fmt: pctF },
+    { g: 'Return ratios', k: 'roce', label: 'ROCE %', dir: 'high', fmt: pctF },
+    { g: 'Return ratios', k: 'ssgr', label: 'SSGR %', dir: 'high', fmt: pctF },
+    // ── Profitability ──
+    { g: 'Profitability metrics', k: 'gpm',     label: 'GPM %',            dir: 'high', fmt: pctF },
+    { g: 'Profitability metrics', k: 'opm',     label: 'OPM %',            dir: 'high', fmt: pctF },
+    { g: 'Profitability metrics', k: 'npm',     label: 'NPM %',            dir: 'high', fmt: pctF },
+    { g: 'Profitability metrics', k: 'revC',    label: 'Sales CAGR 5Y %',  dir: 'high', fmt: pctF },
+    { g: 'Profitability metrics', k: 'profC',   label: 'Profit CAGR 5Y %', dir: 'high', fmt: pctF },
+    { g: 'Profitability metrics', k: 'salesYoY',label: 'Sales YoY %',      dir: 'high', fmt: v => v == null ? '—' : (v >= 0 ? '+' : '') + v + '%' },
+    { g: 'Profitability metrics', k: 'patYoY',  label: 'PAT YoY %',        dir: 'high', fmt: v => v == null ? '—' : (v >= 0 ? '+' : '') + v + '%' },
+    // ── Cashflow ──
+    { g: 'Cashflow metrics', k: 'cfoPat',  label: 'Cum. CFO / PAT',     dir: 'high', fmt: xF },
+    { g: 'Cashflow metrics', k: 'fcf',     label: 'Positive FCF Years', dir: 'high', fmt: v => v == null ? '—' : `${v.pos}/${v.total}`, cmp: v => v == null ? null : v.pos / v.total },
+    { g: 'Cashflow metrics', k: 'cfoCover',label: 'CFO covers CFI+CFF', dir: 'high', fmt: v => v == null ? '—' : (v ? '✓ Yes' : '✗ No'), cmp: v => v == null ? null : (v ? 1 : 0) },
+    // ── Liquidity ──
+    { g: 'Liquidity metrics', k: 'cr',        label: 'Current Ratio',          dir: 'high', fmt: xF },
+    { g: 'Liquidity metrics', k: 'cashSales', label: 'Cash & Equiv. / Sales %', dir: 'high', fmt: pctF },
+    // ── Solvency ──
+    { g: 'Solvency metrics', k: 'de',           label: 'Debt / Equity',      dir: 'low',  fmt: xF },
+    { g: 'Solvency metrics', k: 'icr',          label: 'Interest Coverage',  dir: 'high', fmt: xF },
+    { g: 'Solvency metrics', k: 'reserves',     label: 'Reserves (₹ Cr)',    dir: 'none', fmt: inr },
+    { g: 'Solvency metrics', k: 'promoterHold', label: 'Promoter Holding %', dir: 'high', fmt: pctF },
+    { g: 'Solvency metrics', k: 'pledge',       label: 'Promoter Pledge %',  dir: 'low',  fmt: pctF },
+    // ── Efficiency ──
+    { g: 'Efficiency metrics', k: 'invDays',    label: 'Inventory Days',         dir: 'low',  fmt: v => v == null ? '—' : Math.round(v) },
+    { g: 'Efficiency metrics', k: 'debtorDays', label: 'Debtor Days',            dir: 'low',  fmt: v => v == null ? '—' : Math.round(v) },
+    { g: 'Efficiency metrics', k: 'ccc',        label: 'Cash Conversion Cycle',  dir: 'low',  allowNeg: true, fmt: v => v == null ? '—' : Math.round(v) },
+    { g: 'Efficiency metrics', k: 'nfat',       label: 'Asset Turnover (NFAT)',  dir: 'high', fmt: xF },
+  ];
+
+  // Build a snapshot of the current company's key metrics for comparison
+  function buildCompareSnapshot(d) {
+    const get = makeGetter(d.keyRatios);
+    const num = s => { const v = parseFloat(String(s).replace(/[^0-9.\-]/g, '')); return isNaN(v) ? null : v; };
+    const lastOf = arr => { if (!arr) return null; for (let i = arr.length - 1; i >= 0; i--) if (arr[i] != null) return arr[i]; return null; };
+    const pnlLast = (...keys) => d.pnl ? lastOf(findRowLocal(d.pnl.data, ...keys)) : null;
+
+    // Current ratio
+    let cr = null;
+    if (d.balanceSheet) {
+      const bget = (...k) => lastOf(findRowLocal(d.balanceSheet.data, ...k));
+      const inv  = bget('Inventories', 'Inventory', 'Stocks');
+      const recv = bget('Trade receivables', 'Trade Receivables', 'Sundry Debtors', 'Debtors');
+      const cash = bget('Cash Equivalents', 'Cash and Bank Balances', 'Cash & Bank', 'Cash and Cash Equivalents', 'Cash & Equivalents', 'Cash');
+      const pay  = bget('Trade Payables', 'Trade payables', 'Sundry Creditors', 'Creditors');
+      const ca = (inv || 0) + (recv || 0) + (cash || 0);
+      if (pay && pay > 0) cr = parseFloat((ca / pay).toFixed(2));
+    }
+    // Interest coverage
+    const op = pnlLast('Operating Profit', 'EBITDA'), interest = pnlLast('Interest', 'Finance Costs', 'Interest Expense');
+    let icr = (op != null && interest != null && interest !== 0) ? parseFloat((op / interest).toFixed(1)) : null;
+    // PEG (YoY) — P/E ÷ latest year-over-year EPS growth
+    let peg = null;
+    const epsRow = d.pnl ? findRowLocal(d.pnl.data, 'EPS in Rs', 'EPS', 'Adjusted EPS in Rs') : null;
+    if (epsRow && d.derived?.pe) {
+      const vals = epsRow.filter(v => v != null && !isNaN(v));
+      if (vals.length >= 2) {
+        const s = vals[vals.length - 2], e = vals[vals.length - 1];
+        if (s > 0 && e > 0) { const g = (e / s - 1) * 100; if (g > 0) peg = parseFloat((d.derived.pe / g).toFixed(2)); }
+      }
+    }
+
+    // Cumulative CFO / PAT
+    const cumPAT = d.derived?.cumPAT || [], cumCFO = d.derived?.cumCFO || [];
+    const patTot = cumPAT.length ? cumPAT[cumPAT.length - 1] : null;
+    const cfoTot = cumCFO.length ? cumCFO[cumCFO.length - 1] : null;
+    const cfoPat = (patTot != null && cfoTot != null && patTot !== 0) ? parseFloat((cfoTot / patTot).toFixed(2)) : null;
+    // FCF positive years
+    const fcfArr = (d.derived?.fcfArr || []).filter(v => v != null);
+    const fcf = fcfArr.length ? { pos: fcfArr.filter(v => v > 0).length, total: fcfArr.length } : null;
+    // CFO covers CFI + CFF outflows (latest year)
+    const cfd = d.cashFlow ? d.cashFlow.data : null;
+    const cfoL = cfd ? lastOf(findRowLocal(cfd, 'Cash from Operating Activity')) : null;
+    const cfiL = cfd ? lastOf(findRowLocal(cfd, 'Cash from Investing Activity')) : null;
+    const cffL = cfd ? lastOf(findRowLocal(cfd, 'Cash from Financing Activity')) : null;
+    let cfoCover = null;
+    if (cfoL != null) {
+      const outflow = (cfiL != null ? Math.min(0, cfiL) : 0) + (cffL != null ? Math.min(0, cffL) : 0);
+      cfoCover = cfoL > 0 && cfoL >= Math.abs(outflow);
+    }
+    // Sales & PAT YoY growth (latest year)
+    const yoy = (...keys) => {
+      const arr = d.pnl ? findRowLocal(d.pnl.data, ...keys) : null;
+      if (!arr) return null;
+      const v = arr.filter(x => x != null);
+      if (v.length < 2) return null;
+      const a = v[v.length - 2], b = v[v.length - 1];
+      return (a == null || a === 0) ? null : parseFloat(((b - a) / Math.abs(a) * 100).toFixed(1));
+    };
+    const salesYoY = yoy('Sales', 'Revenue', 'Net Sales', 'Total Revenue');
+    const patYoY   = yoy('Net Profit', 'Profit after tax', 'PAT');
+
+    // Working-capital / efficiency ratios (from screener's ratios table)
+    const rget = (...k) => d.ratios ? lastOf(findRowLocal(d.ratios.data, ...k)) : null;
+    const invDays    = rget('Inventory Days');
+    const debtorDays = rget('Debtor Days');
+    const ccc        = rget('Cash Conversion Cycle');
+
+    // Asset turnover (NFAT) = latest Sales ÷ avg(Fixed Assets)
+    let nfat = null;
+    if (d.balanceSheet && d.pnl) {
+      const fa = findRowLocal(d.balanceSheet.data, 'Fixed Assets', 'Net Fixed Assets', 'Tangible Assets', 'Property Plant Equipment');
+      const salesR = findRowLocal(d.pnl.data, 'Sales', 'Revenue', 'Net Sales', 'Total Revenue');
+      if (fa && salesR) {
+        const faEnd = fa[fa.length - 1], faStart = fa.length > 1 ? fa[fa.length - 2] : faEnd;
+        const s = salesR[salesR.length - 1];
+        const avgFA = faStart != null ? (faStart + faEnd) / 2 : faEnd;
+        if (s != null && avgFA > 0) nfat = parseFloat((s / avgFA).toFixed(2));
+      }
+    }
+
+    // Cash & equivalents to sales ratio (%)
+    const cashL  = d.balanceSheet ? lastOf(findRowLocal(d.balanceSheet.data, 'Cash Equivalents', 'Cash and Bank Balances', 'Cash & Bank', 'Cash and Cash Equivalents', 'Cash & Equivalents', 'Cash')) : null;
+    const salesL = pnlLast('Sales', 'Revenue', 'Net Sales', 'Total Revenue');
+    const cashSales = (cashL != null && salesL && salesL > 0) ? parseFloat((cashL / salesL * 100).toFixed(1)) : null;
+
+    // Current price
+    const price = num(get('current price'));
+    // 52-week high / low (from "High / Low" top-ratio, e.g. "₹4,884 / 2,131")
+    let hl52 = null;
+    const hlStr = get('high / low');
+    if (hlStr && hlStr !== 'N/A') {
+      const m = String(hlStr).replace(/,/g, '').match(/([\d.]+)\s*\/\s*([\d.]+)/);
+      if (m) hl52 = { hi: parseFloat(m[1]), lo: parseFloat(m[2]) };
+    }
+    // Promoter holding % (latest quarter)
+    let promoterHold = null;
+    if (d.shareholding?.data) {
+      const pr = findRowLocal(d.shareholding.data, 'Promoter', 'Promoters', 'Promoter Group');
+      if (pr) promoterHold = lastOf(pr);
+    }
+    // Reserves (₹ Cr)
+    const reserves = d.balanceSheet ? lastOf(findRowLocal(d.balanceSheet.data, 'Reserves', 'Reserves and Surplus', 'Other Equity')) : null;
+
+    const id = (d.nseSymbol || d.companyName || 'company').trim();
+    return {
+      id, name: d.companyName || d.nseSymbol || 'Company', symbol: d.nseSymbol || '', ts: Date.now(),
+      m: {
+        cfoPat, fcf, cfoCover, salesYoY, patYoY,
+        invDays, debtorDays, ccc, nfat, cashSales,
+        price, hl52, promoterHold, reserves,
+        mcap:   num(get('market cap')),
+        pe:     d.derived?.pe ?? num(get('stock p/e')),
+        ps:     d.derived?.psRange?.current ?? null,
+        ev:     d.derived?.evRange?.current ?? null,
+        peg,
+        roe:    num(get('roe')),
+        roce:   num(get('roce')),
+        gpm:    latestGPM(d.pnl),
+        opm:    pnlLast('OPM %'),
+        npm:    lastOf(d.derived?.npm),
+        revC:   d.derived?.revCAGR5 ?? null,
+        profC:  d.derived?.profCAGR5 ?? null,
+        de:     lastOf(d.derived?.debtEquity),
+        cr,
+        icr,
+        pledge: num(get('pledged')),
+        ssgr:   d.derived?.ssgrFinal ?? null,
+      },
+    };
+  }
+
+  function tabCompare(d) {
+    const basket = getBasket();
+    const curId  = (d.nseSymbol || d.companyName || '').trim();
+    const inBasket = basket.some(b => b.id === curId);
+    const btn = 'background:#3b82f6;border:none;border-radius:6px;color:#fff;font-size:11px;font-weight:600;cursor:pointer;padding:6px 12px';
+    const btnGhost = 'background:none;border:1px solid #334155;border-radius:6px;color:#94a3b8;font-size:11px;cursor:pointer;padding:6px 12px';
+
+    let html = `${sectionHead('Compare Companies')}
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+        ${inBasket
+          ? `<span style="font-size:11px;color:#34d399">✓ ${d.companyName || 'This company'} is in the comparison</span>`
+          : `<button id="si-cmp-add" style="${btn}">➕ Add ${d.companyName || 'this company'}</button>`}
+        ${basket.length ? `<button id="si-cmp-clear" style="${btnGhost}">Clear all</button>` : ''}
+      </div>`;
+
+    if (!basket.length) {
+      return html + callout('info', 'No companies added yet. Open any company on screener.in and click <strong>“➕ Add”</strong> here to snapshot it. Add 2 or more to compare them side-by-side. Snapshots are saved locally and persist across sessions.');
+    }
+
+    const colSpan = basket.length + 1;
+
+    // ── Overall score: each rankable metric normalised 0–100 between the
+    // best & worst in the basket (by direction), then averaged per company.
+    const scores = basket.map(() => ({ sum: 0, cnt: 0, wins: 0 }));
+    const groupAgg = basket.map(() => ({}));   // per-company, per-category {sum,cnt}
+    CMP_METRICS.forEach(mt => {
+      if (mt.dir === 'none') return;
+      const raw = basket.map(b => b.m ? (mt.cmp ? mt.cmp(b.m[mt.k]) : b.m[mt.k]) : null);
+      const valid = raw.map(n => (typeof n === 'number' && !isNaN(n) && (mt.dir === 'low' && !mt.allowNeg ? n > 0 : true)) ? n : null);
+      const present = valid.filter(n => n != null);
+      if (present.length < 2) return;           // need at least 2 companies to rank
+      const mn = Math.min(...present), mx = Math.max(...present), span = mx - mn;
+      const bestVal = mt.dir === 'high' ? mx : mn;
+      valid.forEach((n, i) => {
+        if (n == null) return;
+        const norm = span === 0 ? 1 : (mt.dir === 'high' ? (n - mn) / span : (mx - n) / span);
+        scores[i].sum += norm; scores[i].cnt++;
+        if (n === bestVal) scores[i].wins++;
+        const ga = groupAgg[i][mt.g] || (groupAgg[i][mt.g] = { sum: 0, cnt: 0 });
+        ga.sum += norm; ga.cnt++;
+      });
+    });
+    const scorePct = scores.map(s => s.cnt ? Math.round(s.sum / s.cnt * 100) : null);
+    const maxScore = Math.max(-1, ...scorePct.filter(v => v != null));
+    const winnerIdx = scorePct.indexOf(maxScore);
+
+    // ── Per-category leaders ──
+    const shortCat = g => g.replace(' metrics', '').replace('Return ratios', 'Returns');
+    const catWinners = CMP_GROUPS.map(g => {
+      const avgs = basket.map((_, i) => { const a = groupAgg[i][g]; return a && a.cnt ? a.sum / a.cnt : null; });
+      const present = avgs.map((v, i) => ({ v, i })).filter(o => o.v != null);
+      if (present.length < 2) return null;
+      const best = present.reduce((a, b) => b.v > a.v ? b : a);
+      return { cat: shortCat(g), name: basket[best.i].symbol || basket[best.i].name };
+    }).filter(Boolean);
+    const catInner = catWinners.length ? `
+      <div style="font-size:9px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:5px">Category Leaders</div>
+      <div class="si-table-wrap" style="max-height:none;overflow:visible">
+        <table class="si-table" style="width:100%">
+          <thead><tr><th>Category</th><th style="text-align:right">Leader</th></tr></thead>
+          <tbody>
+            ${catWinners.map(c => `<tr>
+              <td style="color:#818cf8;font-weight:600;white-space:nowrap">${c.cat}</td>
+              <td style="text-align:right !important;font-weight:700;color:#e2e8f0;white-space:nowrap">🏆 ${c.name}</td>
+            </tr>`).join('')}
+          </tbody>
+        </table>
+      </div>` : '';
+
+    // Rank map for medals
+    const ranked = scorePct.map((v, i) => ({ v, i })).filter(o => o.v != null).sort((a, b) => b.v - a.v);
+    const rankOf = {}; ranked.forEach((o, r) => { rankOf[o.i] = r + 1; });
+    const medal = r => r === 1 ? '🥇' : r === 2 ? '🥈' : r === 3 ? '🥉' : `#${r}`;
+
+    // ── Score card elements (combined with category leaders below) ──
+    const scoreCardEls = basket.length >= 2 ? basket.map((b, i) => {
+      const v = scorePct[i], win = v != null && v === maxScore;
+      return `<div style="flex:1;min-width:96px;background:${win ? 'linear-gradient(160deg,#10241c,#0f1b2d)' : '#1a2438'};border:1px solid ${win ? '#34d39966' : '#293548'};border-radius:9px;padding:6px 9px">
+        <div style="font-size:9px;color:#94a3b8;font-weight:600;letter-spacing:.3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${b.symbol || b.name}</div>
+        <div style="display:flex;align-items:baseline;gap:4px;margin-top:1px">
+          <span style="font-size:18px;font-weight:800;line-height:1;color:${win ? '#34d399' : '#e2e8f0'}">${v == null ? '—' : v}</span>
+          <span style="font-size:9px;color:#64748b">/100</span>
+          ${v != null ? `<span style="margin-left:auto;font-size:12px">${medal(rankOf[i])}</span>` : ''}
+        </div>
+        <div style="font-size:8px;color:#64748b;margin-top:2px">${scores[i].wins} metric win${scores[i].wins === 1 ? '' : 's'}</div>
+      </div>`;
+    }).join('') : '';
+
+    // Top region: overall-score cards (left) + category leaders (right), side-by-side
+    const topRegion = (scoreCardEls || catInner) ? `
+      <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-start;margin-bottom:12px">
+        ${scoreCardEls ? `<div style="flex:2;min-width:230px">
+          <div style="font-size:9px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:5px">Overall Score</div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap">${scoreCardEls}</div>
+        </div>` : ''}
+        ${catInner ? `<div style="flex:1;min-width:210px">${catInner}</div>` : ''}
+      </div>` : '';
+
+    // ── Header columns (winner tinted, right-aligned to match values) ──
+    const headCols = basket.map((b, i) => {
+      const win = i === winnerIdx && maxScore >= 0;
+      return `<th style="text-align:right !important;white-space:normal;overflow-wrap:anywhere;padding:8px 12px !important;color:${win ? '#34d399' : '#e2e8f0'} !important">
+        ${win ? '🏆 ' : ''}${b.symbol || b.name}
+        <button class="si-cmp-rm" data-id="${b.id}" title="Remove from comparison" style="background:none;border:none;color:#64748b;cursor:pointer;font-size:12px;margin-left:4px;vertical-align:middle">✕</button>
+      </th>`;
+    }).join('');
+
+    const rowFor = mt => {
+      const vals = basket.map(b => b.m ? b.m[mt.k] : null);
+      const nums = vals.map(v => mt.cmp ? mt.cmp(v) : v);   // numeric value used for ranking
+      let bestIdx = -1;
+      if (mt.dir !== 'none') {
+        const cand = nums.map((n, i) => ({ n, i }))
+          .filter(o => typeof o.n === 'number' && !isNaN(o.n) && (mt.dir === 'low' && !mt.allowNeg ? o.n > 0 : true));
+        if (cand.length) {
+          const best = mt.dir === 'high' ? cand.reduce((a, b) => b.n > a.n ? b : a) : cand.reduce((a, b) => b.n < a.n ? b : a);
+          bestIdx = best.i;
+        }
+      }
+      const cells = vals.map((v, i) =>
+        `<td style="text-align:right !important;font-variant-numeric:tabular-nums;${i === bestIdx ? 'color:#34d399 !important;font-weight:700' : ''}">${mt.fmt(v)}</td>`).join('');
+      return `<tr><td style="white-space:nowrap;color:#cbd5e1">${mt.label}</td>${cells}</tr>`;
+    };
+    const rows = CMP_GROUPS.map(g => {
+      const ms = CMP_METRICS.filter(m => m.g === g);
+      if (!ms.length) return '';
+      const header = `<tr><td colspan="${colSpan}" style="background:#0f1b2d !important;color:#818cf8 !important;font-weight:700;font-size:9.5px;letter-spacing:.6px;text-transform:uppercase;padding:8px 14px !important;border-top:1px solid #293548 !important">${g}</td></tr>`;
+      return header + ms.map(rowFor).join('');
+    }).join('');
+
+    html += `
+      ${topRegion}
+      <div class="si-table-wrap" style="max-height:none;overflow:auto">
+        <table class="si-table" style="line-height:1.55;table-layout:fixed;width:100%;min-width:${170 + basket.length * 90}px">
+          <colgroup>
+            <col style="width:170px">
+            ${basket.map(() => '<col style="width:auto">').join('')}
+          </colgroup>
+          <thead><tr><th>Metric</th>${headCols}</tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+      <div style="margin-top:8px;font-size:10px;color:#64748b;line-height:1.5">
+        🏆 <strong>Overall Score</strong> (0–100) ranks each company <em>against the others in this basket</em>: per metric, scored between the worst (0) and best (100), then averaged. It's a relative read, not an absolute grade. Best value in each row is green (lower is better for valuation/leverage/days; higher for returns/growth). Re-add a company to refresh its snapshot.
+      </div>`;
+    return html;
   }
 
   // Layer 3 — Valuation + Final Scorecard
@@ -1359,6 +1794,8 @@ ScreenerInsights.panel = (() => {
     const cumCFO = d.derived?.cumCFO || [];
     const patTot = cumPAT.length ? cumPAT[cumPAT.length - 1] : null;
     const cfoTot = cumCFO.length ? cumCFO[cumCFO.length - 1] : null;
+    // Number of years actually covered by the cumulative series
+    const pcYears = Math.min(cumPAT.length, cumCFO.length);
     let pcRatio = null;
     if (patTot != null && cfoTot != null && patTot !== 0) pcRatio = cfoTot / patTot;
     // CFO meeting or exceeding PAT is good (profits backed by cash). Only CFO
@@ -1367,8 +1804,28 @@ ScreenerInsights.panel = (() => {
                    : pcRatio >= 0.8 ? 'pass'
                    : pcRatio >= 0.6 ? 'caution'
                    : 'fail';
+    const pcSpan = pcYears > 0 ? ` (based on ${pcYears} year${pcYears === 1 ? '' : 's'} of data${pcYears < 10 ? ', <10y available' : ''})` : '';
     const pcNote = pcRatio == null ? 'Insufficient cumulative data'
-                 : `Cumulative CFO/PAT ${pcRatio.toFixed(2)}x — ${pcRatio >= 1.2 ? 'cash comfortably exceeds reported profit (strong earnings quality)' : pcRatio >= 0.8 ? 'profits well backed by cash' : pcRatio >= 0.6 ? 'cash somewhat trails profit — monitor earnings quality' : 'cash well below reported profit (earnings-quality red flag)'}`;
+                 : `Cumulative CFO/PAT ${pcRatio.toFixed(2)}x — ${pcRatio >= 1.2 ? 'cash comfortably exceeds reported profit (strong earnings quality)' : pcRatio >= 0.8 ? 'profits well backed by cash' : pcRatio >= 0.6 ? 'cash somewhat trails profit — monitor earnings quality' : 'cash well below reported profit (earnings-quality red flag)'}${pcSpan}`;
+
+    // 9. Promoter pledging — any pledge is a flag
+    const pledgePct = (() => {
+      const kr = get('pledged');
+      let v = (kr && kr !== 'N/A') ? parseFloat(String(kr).replace(/[^0-9.]/g, '')) : NaN;
+      if (isNaN(v) && d.shareholding?.data?.['__pledgePct__']) {
+        const arr = d.shareholding.data['__pledgePct__'];
+        for (let i = arr.length - 1; i >= 0; i--) { if (arr[i] != null) { v = arr[i]; break; } }
+      }
+      return isNaN(v) ? null : v;
+    })();
+    const pledgeStatus = pledgePct == null ? 'info'
+                       : pledgePct === 0 ? 'pass'
+                       : pledgePct <= 10 ? 'caution'
+                       : 'fail';
+    const pledgeNote = pledgePct == null ? 'Pledge data unavailable'
+                     : pledgePct === 0 ? 'No promoter shares pledged'
+                     : pledgePct <= 10 ? `${pledgePct}% of promoter holding pledged — monitor (pledging signals promoter cash stress)`
+                     : `${pledgePct}% of promoter holding pledged — high; significant risk if share price falls`;
 
     const checklist = [
       { p: 'Sales Growth',        target: '>15%/yr; >50% unsustainable', status: salesStatus, note: salesNote },
@@ -1378,11 +1835,12 @@ ScreenerInsights.panel = (() => {
       { p: 'Debt / Equity',       target: '< 0.5x',                       status: deStatus,    note: deNote },
       { p: 'Current Ratio',       target: '> 1.25x',                      status: crStatus,    note: crNote },
       { p: 'Cash Flow (CFO)',     target: 'Positive; covers CFI+CFF',     status: cfStatus,    note: cfNote },
-      { p: 'Cumulative PAT vs CFO', target: 'CFO ≥ PAT over 10Y',          status: pcStatus,    note: pcNote },
+      { p: 'Cumulative PAT vs CFO', target: `CFO ≥ PAT over ${pcYears >= 10 ? '10Y' : pcYears > 0 ? pcYears + 'Y' : '10Y'}`, status: pcStatus, note: pcNote },
       { p: 'Free Cash Flow',      target: 'Consistently positive',        status: fcfStatus,
         note: fcfArr.length ? `${posFCF}/${fcfArr.length} years positive FCF` : 'No FCF data' },
       { p: 'SSGR',                target: '≥ sales growth (self-funded)',  status: ssgrStatus,
         note: fw.ssgrFinal != null ? `Self-sustainable growth ${fw.ssgrFinal}%${salesCAGR != null ? ` vs ${salesCAGR.toFixed(1)}% sales CAGR` : ''}` : 'SSGR unavailable' },
+      { p: 'Promoter Pledging',   target: 'Nil (0%)',                     status: pledgeStatus, note: pledgeNote },
     ];
 
     const checkRows = checklist.map(c => `
@@ -2065,8 +2523,8 @@ ScreenerInsights.panel = (() => {
             renderCharts('overview', d);
           };
         }
-        const vbg = raw.map(p => p.pct >= DG ? 'rgba(52,211,153,0.35)' : p.pct >= DA ? 'rgba(251,191,36,0.25)' : 'rgba(248,113,113,0.3)');
-        const vbc = raw.map(p => p.pct >= DG ? 'rgba(52,211,153,0.7)'  : p.pct >= DA ? 'rgba(251,191,36,0.6)'  : 'rgba(248,113,113,0.6)');
+        const vbg = raw.map(p => p.pct == null ? 'rgba(100,116,139,0.3)'  : p.pct >= DG ? 'rgba(52,211,153,0.35)' : p.pct >= DA ? 'rgba(251,191,36,0.25)' : 'rgba(248,113,113,0.3)');
+        const vbc = raw.map(p => p.pct == null ? 'rgba(100,116,139,0.55)' : p.pct >= DG ? 'rgba(52,211,153,0.7)'  : p.pct >= DA ? 'rgba(251,191,36,0.6)'  : 'rgba(248,113,113,0.6)');
         make('si-c-price-vol', {
           type: 'bar',
           data: {
@@ -3903,6 +4361,28 @@ ScreenerInsights.panel = (() => {
       setupBlockReorder('si_ssgr_block_order', () => switchTab('ssgr'));
     }
 
+    if (tab === 'valuation') {
+      document.querySelectorAll('input[name="si-peg-years"]').forEach(radio => {
+        radio.addEventListener('change', () => {
+          savePegYears(parseInt(radio.value, 10));
+          switchTab('valuation');   // rebuild so PEG recalculates with the new window
+        });
+      });
+    }
+
+    if (tab === 'compare') {
+      document.getElementById('si-cmp-add')?.addEventListener('click', () => {
+        addToBasket(buildCompareSnapshot(d));
+        switchTab('compare');
+      });
+      document.getElementById('si-cmp-clear')?.addEventListener('click', () => {
+        saveBasket([]);
+        switchTab('compare');
+      });
+      document.querySelectorAll('.si-cmp-rm').forEach(b =>
+        b.addEventListener('click', () => { removeFromBasket(b.dataset.id); switchTab('compare'); }));
+    }
+
     if (tab === 'delivery') {
       loadDeliveryChart();
     }
@@ -3919,6 +4399,7 @@ ScreenerInsights.panel = (() => {
     { id: 'pnl',        label: 'P & L',       icon: '₹' },
     { id: 'balance-sheet', label: 'B / S',    icon: '⚖'  },
     { id: 'cash-flow',  label: 'Cash Flow',   icon: '↻'  },
+    { id: 'compare',    label: 'Compare',     icon: '⇄' },
   ];
 
   const CONTENT = {
@@ -3930,6 +4411,7 @@ ScreenerInsights.panel = (() => {
     ssgr:          tabSSGR,
     valuation:     tabValuation,
     scorecard:     tabScorecard,
+    compare:       tabCompare,
   };
 
   // ── Tab switch ────────────────────────────────────────────────────────────
@@ -3943,7 +4425,11 @@ ScreenerInsights.panel = (() => {
     if (!body) return;
     const builder = CONTENT[id];
     body.innerHTML = builder ? builder(appData) : '';
-    setTimeout(() => renderCharts(id, appData), 60);
+    body.scrollTop = 0;                          // always start a tab at the top
+    setTimeout(() => {
+      renderCharts(id, appData);
+      body.scrollTop = 0;                        // re-assert after blocks reorder / charts render
+    }, 60);
   }
 
   // ── Resize ────────────────────────────────────────────────────────────────

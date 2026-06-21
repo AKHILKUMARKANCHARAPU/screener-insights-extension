@@ -466,12 +466,39 @@ ScreenerInsights.scraper = (() => {
   // API data — which may only contain older holders — to determine recency.
   async function fetchInvestorClass(companyId, classification, trueLatestPeriod) {
     try {
-      const resp = await fetch(`/api/3/${companyId}/investors/${classification}/quarterly/`, {
-        headers: { 'X-Requested-With': 'XMLHttpRequest' }
-      });
-      if (!resp.ok) return [];
-      const json = await resp.json();
-      if (!json || typeof json !== 'object' || Array.isArray(json)) return [];
+      // Screener serves the named-holder breakdown under inconsistent paths and
+      // classification slugs across companies. Try the known variants and use
+      // the first that returns real holder rows, so a single path change (or a
+      // company served under a different slug) can't blank the whole feature.
+      const slugAliases = {
+        foreign_institutions:  ['foreign_institutions', 'fii', 'foreign_institutional_investors'],
+        domestic_institutions: ['domestic_institutions', 'dii', 'domestic_institutional_investors', 'mutual_funds'],
+        public:                ['public'],
+        others:                ['others'],
+      }[classification] || [classification];
+
+      const candidates = [];
+      for (const slug of slugAliases) {
+        candidates.push(`/api/3/${companyId}/investors/${slug}/quarterly/`);
+        candidates.push(`/api/company/${companyId}/investors/${slug}/quarterly/`);
+        candidates.push(`/api/3/${companyId}/investors/${slug}/`);
+      }
+
+      let json = null, usedUrl = null;
+      for (const url of candidates) {
+        try {
+          const resp = await fetch(url, { headers: { 'X-Requested-With': 'XMLHttpRequest' } });
+          if (!resp.ok) continue;
+          const j = await resp.json();
+          if (j && typeof j === 'object' && !Array.isArray(j) &&
+              Object.keys(j).filter(k => k !== 'isExpandable').length) {
+            json = j; usedUrl = url; break;
+          }
+        } catch (_) { /* try next candidate */ }
+      }
+      if (!json) { console.debug('[SI] investors: no endpoint returned data for', classification); return []; }
+      console.debug('[SI] investors:', classification, 'via', usedUrl);
+
       const entries = Object.entries(json).filter(([k]) => k !== 'isExpandable');
       if (!entries.length) return [];
 
@@ -481,21 +508,24 @@ ScreenerInsights.scraper = (() => {
         return (parseInt(y) || 0) * 100 + (MONTH_ORDER[m] || 0);
       };
 
-      // The authoritative latest period — must come from the main shareholding
-      // table, not from the investor sub-data (which may lag or be sparse).
+      // Reference = the latest quarter from the MAIN shareholding table. A holder
+      // must still appear in THAT quarter to be "current"; a holder whose last
+      // reported quarter is older has exited (e.g. Govt of Singapore that sold
+      // out by the latest quarter). Anchoring to the holder sub-data's own latest
+      // would wrongly resurrect exited holders, so we anchor to the main table.
+      const periodRe = /[A-Z][a-z]{2} \d{4}/;
       const latestScore = parsePeriod(trueLatestPeriod);
 
       return entries.map(([name, periodData]) => {
         const sorted = Object.entries(periodData)
-          .filter(([k]) => k !== 'isExpandable' && /[A-Z][a-z]{2} \d{4}/.test(k))
+          .filter(([k]) => k !== 'isExpandable' && periodRe.test(k))
           .sort(([a], [b]) => parsePeriod(a) - parsePeriod(b));
 
-        // Only include if the holder's most recent reported period matches the
-        // true latest period. A holder whose last data is older has exited.
         const withVal = sorted.filter(([, v]) => parseFloat(String(v).replace(/,/g, '')) > 0);
         if (!withVal.length) return null;
         const lastReported = withVal[withVal.length - 1];
-        if (parsePeriod(lastReported[0]) < latestScore) return null; // exited before latest quarter
+        // Exclude any holder not present in the latest quarter (they've exited).
+        if (parsePeriod(lastReported[0]) < latestScore) return null;
 
         const latestVal = parseFloat(String(lastReported[1]).replace(/,/g, ''));
         const prevEntry = withVal.length > 1 ? withVal[withVal.length - 2] : null;
@@ -532,29 +562,42 @@ ScreenerInsights.scraper = (() => {
   // ── PE Range (5Y) ────────────────────────────────────────────────────────
 
   async function fetchDeliveryData(companyId) {
-    try {
-      const consolidated = location.pathname.includes('/consolidated') ? '&consolidated=true' : '';
-      const url = `/api/company/${companyId}/chart/?q=Price-Volume&days=365${consolidated}`;
+    const consolidated = location.pathname.includes('/consolidated') ? '&consolidated=true' : '';
+    // Use the same metric-name format as the (working) price-series query.
+    const urls = [
+      `/api/company/${companyId}/chart/?q=Price-DMA50-DMA200-Volume&days=365${consolidated}`,
+      `/api/company/${companyId}/chart/?q=Price-Volume&days=365${consolidated}`,
+    ];
+    const tryFetch = async (url) => {
       const resp = await fetch(url);
-      if (!resp.ok) return null;
-      const json = await resp.json();
+      if (!resp.ok) throw new Error('status ' + resp.status);
+      return resp.json();
+    };
+    let json = null;
+    for (const url of urls) {
+      try { json = await tryFetch(url); break; }
+      catch (e) { console.debug('[SI] deliveryData fetch failed for', url, e.message); }
+    }
+    if (!json) return null;
+    try {
       // Volume: [date, volume, {delivery: pct}]  Price: [date, price]
       const volDs   = (json.datasets || []).find(ds => ds.label === 'Volume');
       const priceDs = (json.datasets || []).find(ds => ds.label === 'Price' || ds.label === 'Price on NSE' || ds.label === 'Price on BSE');
-      if (!volDs?.values?.length) return null;
-      // Build a price map keyed by date for quick lookup
+      if (!volDs?.values?.length) { console.debug('[SI] deliveryData: no Volume dataset'); return null; }
       const priceMap = {};
       (priceDs?.values || []).forEach(([dt, p]) => {
         const num = typeof p === 'number' ? p : parseFloat(String(p).replace(/,/g, ''));
         if (!isNaN(num)) priceMap[dt] = num;
       });
-      const result = [];
-      for (const v of volDs.values) {
-        const pct = v[2]?.delivery;
-        if (pct != null) result.push({ date: v[0], pct, volume: v[1], price: priceMap[v[0]] ?? null });
-      }
+      // Keep ALL points so Price & Volume always renders; delivery % is optional per row.
+      const result = volDs.values.map(v => ({
+        date: v[0],
+        volume: v[1],
+        pct: (v[2] && v[2].delivery != null) ? v[2].delivery : null,
+        price: priceMap[v[0]] ?? null,
+      }));
       return result.length ? result : null;
-    } catch (_) { return null; }
+    } catch (e) { console.debug('[SI] deliveryData parse error:', e); return null; }
   }
 
   async function fetchPERange(companyId, currentPEFromPage) {
@@ -764,6 +807,7 @@ ScreenerInsights.scraper = (() => {
     const keyRatios   = parseTopRatios();
 
     const pnl          = parseTable('profit-loss');
+    await fetchAndMergeSchedules(pnl, 'profit-loss');   // pulls Expenses breakdown (raw material, etc.) for GPM
     const bs           = parseTable('balance-sheet');
     await fetchAndMergeSchedules(bs, 'balance-sheet');
     const cf           = parseTable('cash-flow');
